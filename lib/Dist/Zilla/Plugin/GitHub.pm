@@ -1,22 +1,66 @@
 package Dist::Zilla::Plugin::GitHub;
-
+use strict;
+use warnings;
 use JSON;
 use Moose;
 use Try::Tiny;
-use HTTP::Tiny;
+use Net::Github 0.44;
 
-use strict;
-use warnings;
 
 has 'repo' => (
 	is      => 'ro',
 	isa     => 'Maybe[Str]'
 );
 
+has 'config_file' => (
+    is => 'ro',
+    isa => 'Str',
+    default => sub {
+        require File::Spec;
+        require Dist::Zilla::Util;
+
+        return File::Spec->catfile(
+            Dist::Zilla::Util->_global_config_root(),
+            'github.ini'
+        );
+    }
+);
+
+has 'username' => (
+    is  => 'ro',
+    isa => 'Str',
+    default => sub {
+        my $user = `git config github.user`;
+        chomp $user;
+        unless ($user) {
+            warn <<'END';
+Couldn't get your github username from git config; run:
+
+    $ git config --global github.user
+
+Guessing from the 'origin' remote...
+END
+            require List::MoreUtils;
+            my @git_remotes =                           # Read from the bottom up:
+                map { URI->new("ssh://$_") }            # 5. turn into a URI::ssh
+                List::MoreUtils::uniq map { $_->[1] }   # 4. uniq by the middle element (the url)
+                map { [split /\s/] }                    # 3. split on whitespace
+                grep { m/^origin\s+git\@/ }             # 2. take only ones called origin which are ssh
+                split /\n/, `git remote -v`;            # 1. get all the git remotes
+            foreach my $remote_url (@git_remotes) {
+                $user = (split /:/, $remote_url->authority)[1];
+                last if $user;
+            }
+        }
+        return $user;
+    } # end sub
+);
+
 has 'api'  => (
 	is      => 'ro',
-	isa     => 'Str',
-	default => 'https://api.github.com'
+	isa     => 'Net::Github::V3',
+	lazy    => 1,
+	builder => '_build_api',
 );
 
 =head1 NAME
@@ -41,59 +85,49 @@ The following is the list of the plugins shipped in this distribution:
 =back
 =cut
 
-sub _get_credentials {
-	my ($self, $nopass) = @_;
+sub _build_api {
+    my $self = shift;
+    my $token = try {
+        require Config::INI::Reader;
+        my $access = Config::INI::Reader->read_file( $self->config_file );
+        $access->{'api.github.com'}->{token};
+    }
+    catch {
+        $self->log("Error: $_");
 
-	my ($login, $pass, $token);
+        require Term::ReadKey;
+        Term::ReadKey::ReadMode('noecho');
+        my $pass = $self->zilla->chrome->term_ui->get_reply(
+            prompt => 'GitHub password for ' . $self->user,
+            allow  => sub { defined $_[0] and length $_[0] }
+        );
+        Term::ReadKey::ReadMode('normal');
 
-	$login = `git config github.user`;  chomp $login;
+        my $gh = Net::GitHub::V3->new( login => $user, pass => $pass );
+        my $oauth = $gh->oauth;
+        my $o = $oauth->create_authorization( {
+            scopes => ['user', 'public_repo', 'repo'],
+            note   => __PACKAGE__,
+        });
 
-	if (!$login) {
-		$self -> log("Err: Missing value 'github.user' in git config");
-		return;
-	}
+        require Config::INI::Writer;
+        Config::INI::Writer->write_file( {
+            'api.github.com' => { token => $o->{token} }
+        }, $self->config_file );
+        try {
+            chmod 0600, $self-> config_file;
+        }
+        catch {
+            print "Couldn't make @{[ $self->config_file ]} private: $_";
+        };
 
-	if (!$nopass) {
-		$token = `git config github.token`;    chomp $token;
-		$pass  = `git config github.password`; chomp $pass;
+        $o->{token}; # return
+    };
 
-		if ($token) {
-			$self -> log("Err: Login with GitHub token is deprecated");
-			return (undef, undef);
-		} elsif (!$pass) {
-			require Term::ReadKey;
+    die "Couldn't obtain api.github.com token"
+        unless $token;
 
-			Term::ReadKey::ReadMode('noecho');
-			$pass = $self -> zilla -> chrome
-					-> term_ui -> get_reply(
-				prompt => "GitHub password for '$login'",
-				allow  => sub {
-					defined $_[0] and length $_[0]
-				});
-			Term::ReadKey::ReadMode('normal');
-		}
-	}
-
-	return ($login, $pass);
-}
-
-sub _check_response {
-	my ($self, $response) = @_;
-
-	try {
-		my $json_text = from_json $response -> {'content'};
-
-		if (!$response -> {'success'}) {
-			$self -> log("Err: ", $json_text -> {'message'});
-			return;
-		}
-
-		return $json_text;
-	} catch {
-		$self -> log("Err: Can't connect to GitHub");
-
-		return;
-	}
+    return Net::GitHub->new( access_token => $token );
 }
 
 =head1 ACKNOWLEDGMENTS
